@@ -41,43 +41,37 @@ migration changes the ingestion only.
 
 ## Motivation
 
-Workloads that need "same key, same Pod" routing without a strong guarantee:
-sharded in-memory caches, per-tenant or per-user working sets, long-running
-gRPC or streaming sessions keyed by an application header, connection-heavy
-clients that must not fan out. These are typically service-to-service
-(east/west): clients are not browsers, and a natural key is already on the
-request. The cookie-encoded session persistence from CFP-47089 does not cover
-this use case: it pins each caller to whichever Pod its first request reached,
-so different callers presenting the same key are consistently routed to
-different Pods (see "Key affinity versus caller affinity"). Its other
-drawbacks for east/west traffic (a cookie round trip, a Pod address in a
-client-visible token, no GAMMA support today) are secondary.
-
 Actor and entity-sharding systems (Akka Cluster Sharding, Orleans, Dapr actors)
-are a representative case. Each entity is owned by one Pod at a time, and
-ownership is established lazily: the Pod that receives the first request for an
-entity, identified by a sharding key in the request (for example
+are the representative workload that needs "same key, same Pod" routing without
+a strong guarantee. Each entity is owned by one Pod at a time, and ownership is
+established lazily: the Pod that receives the first request for an entity,
+identified by a sharding key in the request (for example
 `?shardKey=order-8813`), activates it. Every later request for that entity,
 from any service, should reach the owning Pod. Under round robin the framework
 must, for each misrouted request, either forward it internally to the owner (an
 extra hop, extra connections, a cluster-wide ownership lookup on the hot path)
 or re-allocate the actor to the receiving Pod (deactivate, persist state,
-re-activate elsewhere, invalidate cached ownership lookups), which is expensive
-and slow. Consistent hashing on the sharding key makes the first hop correct in
-steady state for every caller, because the mapping depends only on the key and
-the endpoint set. When Pods are added or removed, only the entities whose key
-remaps (about 1/N) change owner, which is the rebalancing these frameworks
-already implement. Session persistence pins callers, not entities: two services
-asking for the same entity are pinned independently.
+re-activate elsewhere, invalidate cached ownership lookups). Consistent hashing
+on the sharding key makes the first hop correct in steady state for every
+caller, because the mapping depends only on the key and the endpoint set. When
+Pods are added or removed, only the entities whose key remaps (about 1/N)
+change owner, which is the rebalancing these frameworks already implement.
+
+This traffic is service-to-service (east/west): clients are not browsers, and a
+natural key is already on the request. The cookie-encoded session persistence
+from CFP-47089 does not cover it: it pins each caller to whichever Pod its first
+request reached, so two services asking for the same entity are pinned
+independently (see "Key affinity versus caller affinity"). Its other drawbacks
+for east/west traffic (a cookie round trip, a Pod address in a client-visible
+token, no GAMMA support today) are secondary.
 
 ### Key affinity versus caller affinity
 
-Session persistence: the routing key is minted by the proxy. The first request
-from a caller is load balanced normally, the proxy picks a Pod, and the
-response carries a cookie encoding that Pod's address. Later requests from the
-same caller present the cookie and return to that Pod. The application's own
-key is not consulted; each caller receives its own cookie. The mapping is
-*caller session → Pod*, established randomly.
+Session persistence: the routing key is minted by the proxy. A caller's first
+request is load balanced normally and the response carries a cookie encoding
+the chosen Pod's address; later requests from that caller present the cookie
+and return to that Pod. The application's own key is not consulted. The mapping
+is *caller session → Pod*, established randomly.
 
 Consistent hashing: the routing key is supplied by the request (header, query
 parameter, client-set cookie, path segment), and the Pod is a deterministic
@@ -93,25 +87,20 @@ Services `orders` and `billing` both call `cart` for tenant `42`:
 | Consistent hash on `x-tenant-id` (this CFP) | `hash(42)`                            | `hash(42)`                            | Yes, from any caller on any node                           |
 
 GEP-1619's "strong" and "weak" describe the durability of a single caller's
-pinning, not cross-caller convergence. On convergence, persistence is strictly
-worse: the probability that N callers with the same key land on one Pod is
-1/M^(N-1) under persistence and 1 under hashing.
+pinning, not cross-caller convergence: the probability that N callers with the
+same key land on one Pod is 1/M^(N-1) under persistence and 1 under hashing.
 
 The same distinction applies within consistent hashing. A per-caller hash
 source (downstream source IP, or a cookie the proxy generates when none is
-present) gives caller affinity only; cross-caller convergence requires a key
-the application puts on the request. The hash-source table below states this
-per source.
-
-Source-IP hashing is the degenerate case: the key is unique per caller, so
-"same key from different callers" never occurs and the effect is that of
-client-IP session persistence (GEP-3798, `Service.spec.sessionAffinity:
-ClientIP`). The two differ in mechanism only. Hashing is stateless and
-deterministic: the same client address maps to the same Pod on every node and
-across proxy restarts, and about 1/N of clients remap when the endpoint set
-changes. Client-IP persistence keeps a server-side stick table: the first
-assignment is random, held for a configured duration, and unaffected by
-endpoints being added. Both depend on the address being unique per client;
+present) gives caller affinity only; the hash-source table below states this
+per source. Source-IP hashing is the degenerate case: the key is unique per
+caller, so the effect is that of client-IP session persistence (GEP-3798,
+`Service.spec.sessionAffinity: ClientIP`), differing in mechanism only. Hashing
+is stateless and deterministic (the same client address maps to the same Pod
+on every node and across proxy restarts; about 1/N of clients remap when the
+endpoint set changes), whereas client-IP persistence keeps a server-side stick
+table (random first assignment, held for a configured duration, unaffected by
+endpoints being added). Both depend on the address being unique per client:
 clients behind NAT, hostNetwork Pods sharing a node address, or requests
 arriving through an external load balancer share the key and therefore share a
 Pod.
@@ -334,8 +323,7 @@ spec:
 
 Every request to `cart:8080` carrying the same `x-tenant-id` reaches the same
 `cart-v1` Pod, from any caller on any node, while `cart-v1`'s endpoint set is
-unchanged. `cart` remains the name callers use and the interception point; it
-takes no part in Pod selection.
+unchanged.
 
 The same annotations on the same Service have the same effect when the Service
 is a `backendRef` of a north/south `HTTPRoute` behind a `Gateway`, or carries
@@ -1355,4 +1343,3 @@ See Key Question 3.
 - [Azure Application Gateway for Containers: Load balancing strategies](https://learn.microsoft.com/en-us/azure/application-gateway/for-containers/load-balancing-strategies)
 - [GKE Gateway: GCPSessionAffinityFilter / GCPTrafficDistributionPolicy](https://github.com/GoogleCloudPlatform/gke-gateway-api), [GKE Gateway traffic management](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/traffic-management)
 - [Kong: KongUpstreamPolicy consistent hashing](https://developer.konghq.com/operator/dataplanes/how-to/configure-upstream-policy/)
-
